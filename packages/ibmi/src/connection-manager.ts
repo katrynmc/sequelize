@@ -1,20 +1,30 @@
 import type { AbstractConnection, ConnectionOptions } from '@sequelize/core';
-import { AbstractConnectionManager, ConnectionRefusedError } from '@sequelize/core';
+import { AbstractConnectionManager, ConnectionError, ConnectionRefusedError } from '@sequelize/core';
+import { inspect } from '@sequelize/utils';
+import { removeUndefined } from '@sequelize/core/_non-semver-use-at-your-own-risk_/utils/object.js';
 import { logger } from '@sequelize/core/_non-semver-use-at-your-own-risk_/utils/logger.js';
 import type { ConnectionParameters, NodeOdbcError, Connection as OdbcConnection } from 'odbc';
 import * as Odbc from 'odbc';
 import type { IBMiDialect } from './dialect.js';
+import type * as IbmDb from 'ibm_db';
 
 const debug = logger.debugContext('connection:ibmi');
 
 export type OdbcModule = typeof Odbc;
+export type IbmDbModule = typeof IbmDb;
 
-export interface IBMiConnection extends AbstractConnection, OdbcConnection {
+export type IBMiModule = OdbcModule | IbmDbModule;
+
+export interface IBMiOdbcConnection extends AbstractConnection, OdbcConnection {
   // properties of ObdcConnection, but not declared in their typings
   connected: boolean;
 }
 
-export interface IBMiConnectionOptions extends Omit<ConnectionParameters, 'connectionString'> {
+export interface IBMiDb2Connection extends AbstractConnection, IbmDb.Database {}
+
+export type IBMiConnection = IBMiOdbcConnection | IBMiDb2Connection;
+
+export interface IBMiOdbcConnectionOptions extends Omit<ConnectionParameters, 'connectionString'> {
   /**
    * Any extra ODBC connection string parts to use.
    *
@@ -43,15 +53,141 @@ export interface IBMiConnectionOptions extends Omit<ConnectionParameters, 'conne
   system?: string;
 }
 
+export interface IBMiDb2ConnectionOptions {
+  /**
+   * ODBC "DATABASE" parameter
+   */
+  database?: string;
+
+  /**
+   * ODBC "HOSTNAME" parameter
+   */
+  hostname?: string;
+
+  /**
+   * Additional ODBC parameters. Used to build the connection string.
+   */
+  odbcOptions?: Record<string, string>;
+
+  /**
+   * ODBC "PWD" parameter
+   */
+  password?: string;
+
+  /**
+   * ODBC "PORT" parameter
+   */
+  port?: number | string;
+
+  /**
+   * Sets ODBC "Security" parameter to SSL
+   */
+  ssl?: boolean;
+
+  /**
+   * ODBC "SSLServerCertificate" parameter
+   */
+  sslServerCertificate?: string;
+
+  /**
+   * ODBC "UID" parameter
+   */
+  username?: string;
+}
+
+export type IBMiConnectionOptions = IBMiOdbcConnectionOptions | IBMiDb2ConnectionOptions;
+
+function isIbmDbModule(lib: IBMiModule): lib is IbmDbModule {
+  return typeof (lib as IbmDbModule).Database === 'function';
+}
+
+function isOdbcModule(lib: IBMiModule): lib is OdbcModule {
+  return typeof (lib as OdbcModule).connect === 'function';
+}
+
 export class IBMiConnectionManager extends AbstractConnectionManager<IBMiDialect, IBMiConnection> {
-  readonly #lib: OdbcModule;
+  readonly #lib: IBMiModule;
+  readonly #connectionType: 'ibm_db' | 'odbc';
 
   constructor(dialect: IBMiDialect) {
     super(dialect);
-    this.#lib = this.dialect.options.odbcModule ?? Odbc;
+
+    this.#lib = this.#resolveConnectionModule(dialect);
+    this.#connectionType = dialect.options.connectionType ?? "odbc";
   }
 
-  async connect(config: ConnectionOptions<IBMiDialect>): Promise<IBMiConnection> {
+  #resolveConnectionModule(dialect: IBMiDialect): IBMiModule {
+    const { connectionType, ibmDbModule, odbcModule } = dialect.options;
+
+    if (connectionType === "ibm_db") {
+      if (!ibmDbModule) {
+        throw new Error(
+          'The "ibm_db" connectionType was specified, but the "ibm_db" module is not installed. You must install it to use the native bindings.',
+        );
+      }
+
+      return ibmDbModule;
+    }
+
+    return odbcModule ?? Odbc;
+  }
+
+  async #connectIBMiDb2(config: IBMiDb2ConnectionOptions): Promise<IBMiDb2Connection> {
+    if (!isIbmDbModule(this.#lib)) {
+      throw new Error(
+        'The "ibm_db" connectionType was specified, but the "ibm_db" module is not loaded correctly.',
+      );
+    }
+
+    const connectionConfig: Record<string, string> = removeUndefined({
+      DATABASE: config.database,
+      HOSTNAME: config.hostname,
+      PORT: config.port ? String(config.port) : '50000',
+      UID: config.username,
+      PWD: config.password,
+      SSLServerCertificate: config.sslServerCertificate,
+    });
+
+    if (config.ssl) {
+      connectionConfig.Security = 'SSL';
+    }
+
+    if (config.odbcOptions) {
+      for (const optionName of Object.keys(config.odbcOptions)) {
+        if (connectionConfig[optionName]) {
+          throw new Error(
+            `Key ${inspect(optionName)} in "odbcOptions" was already set by a built-in option`,
+          );
+        }
+
+        connectionConfig[optionName] = config.odbcOptions[optionName];
+      }
+    }
+
+    // TODO: add relevant Database options to the connection options of this dialect
+    const connection: IBMiDb2Connection = new this.#lib.Database();
+
+    return new Promise((resolve, reject) => {
+      // ibm_db's typings for the OBDC connection string are missing many properties
+      connection.open(connectionConfig as unknown as IbmDb.ConnStr, error => {
+        if (error) {
+          if (error.message && error.message.includes('SQL30081N')) {
+            return void reject(new ConnectionRefusedError(error));
+          }
+
+          return void reject(new ConnectionError(error));
+        }
+
+        return void resolve(connection);
+      });
+    });
+  }
+
+  async #connectOdbc(config: IBMiOdbcConnectionOptions): Promise<IBMiConnection> {
+    if (!isOdbcModule(this.#lib)) {
+      throw new Error('ODBC module not properly loaded.');
+    }
+
     const connectionKeywords = [];
     if (config.odbcConnectionString) {
       connectionKeywords.push(config.odbcConnectionString);
@@ -100,7 +236,24 @@ export class IBMiConnectionManager extends AbstractConnectionManager<IBMiDialect
     return connection;
   }
 
-  async disconnect(connection: IBMiConnection): Promise<void> {
+  async connect(config: ConnectionOptions<IBMiDialect>): Promise<IBMiConnection> {
+    if (this.#connectionType === 'ibm_db') {
+      return this.#connectIBMiDb2(config);
+    }
+
+    return this.#connectOdbc(config);
+  }
+
+  async #disconnectIBMiDb2(connection: IBMiDb2Connection) {
+    // Don't disconnect a connection that is already disconnected
+    if (!this.validate(connection)) {
+      return;
+    }
+
+    await connection.close();
+  }
+
+  async #disconnectOdbc(connection: IBMiOdbcConnection): Promise<void> {
     if (!this.validate(connection)) {
       debug('Tried to disconnect, but connection was already closed.');
 
@@ -118,6 +271,14 @@ export class IBMiConnectionManager extends AbstractConnectionManager<IBMiDialect
         return undefined;
       });
     });
+  }
+
+  async disconnect(connection: IBMiConnection): Promise<void> {
+    if (this.#connectionType === 'ibm_db') {
+      return this.#disconnectIBMiDb2(connection as IBMiDb2Connection);
+    }
+
+    return this.#disconnectOdbc(connection as IBMiOdbcConnection);
   }
 
   validate(connection: IBMiConnection): boolean {

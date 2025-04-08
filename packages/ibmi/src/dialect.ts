@@ -3,8 +3,8 @@ import { AbstractDialect } from '@sequelize/core';
 import { createUnspecifiedOrderedBindCollector } from '@sequelize/core/_non-semver-use-at-your-own-risk_/utils/sql.js';
 import { getSynchronizedTypeKeys } from '@sequelize/utils';
 import * as DataTypes from './_internal/data-types-overrides.js';
-import type { IBMiConnectionOptions, OdbcModule } from './connection-manager.js';
-import { IBMiConnectionManager } from './connection-manager.js';
+import type { IBMiConnectionOptions, OdbcModule, IbmDbModule, IBMiOdbcConnectionOptions, IBMiDb2ConnectionOptions } from './connection-manager.js';
+import { IBMiConnectionManager  } from './connection-manager.js';
 import { IBMiQueryGenerator } from './query-generator.js';
 import { IBMiQueryInterface } from './query-interface.js';
 import { IBMiQuery } from './query.js';
@@ -18,14 +18,18 @@ export interface IbmiDialectOptions {
    * Using this option should only be considered as a last resort,
    * as the Sequelize team cannot guarantee its compatibility.
    */
+  connectionType?: 'odbc' | 'ibm_db';
   odbcModule?: OdbcModule;
+  ibmDbModule?: IbmDbModule;
 }
 
 const DIALECT_OPTION_NAMES = getSynchronizedTypeKeys<IbmiDialectOptions>({
+  connectionType: undefined,
   odbcModule: undefined,
+  ibmDbModule: undefined,
 });
 
-const CONNECTION_OPTION_NAMES = getSynchronizedTypeKeys<IBMiConnectionOptions>({
+const CONNECTION_OPTION_NAMES = getSynchronizedTypeKeys<IBMiOdbcConnectionOptions & IBMiDb2ConnectionOptions>({
   connectionTimeout: undefined,
   loginTimeout: undefined,
   username: undefined,
@@ -33,6 +37,12 @@ const CONNECTION_OPTION_NAMES = getSynchronizedTypeKeys<IBMiConnectionOptions>({
   odbcConnectionString: undefined,
   dataSourceName: undefined,
   password: undefined,
+  database: undefined,
+  hostname: undefined,
+  odbcOptions: undefined,
+  port: undefined,
+  ssl: undefined,
+  sslServerCertificate: undefined,
 });
 
 export class IBMiDialect extends AbstractDialect<IbmiDialectOptions, IBMiConnectionOptions> {
